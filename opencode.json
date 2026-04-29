@@ -1,0 +1,208 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": true,
+  "default_agent": "coordinator",
+  "plugin": [
+    "@howaboua/opencode-roadmap-plugin@latest",
+    "@tarquinen/opencode-dcp@latest"
+  ],
+  "share": "disabled",
+  "provider": {
+    "nvidia": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://integrate.api.nvidia.com/v1",
+        "apiKey": "{env:NVIDIA_API_KEY}"
+      },
+      "models": {
+        "llama-3.3-70b-instruct": {
+          "id": "meta/llama-3.3-70b-instruct",
+          "name": "Llama 3.3 70B",
+          "temperature": true
+        },
+        "llama-3.1-8b-instruct": {
+          "id": "meta/llama-3.1-8b-instruct",
+          "name": "Llama 3.1 8B",
+          "temperature": true
+        },
+        "nemotron-70b-instruct": {
+          "id": "nvidia/llama-3.1-nemotron-70b-instruct",
+          "name": "Nemotron 70B",
+          "temperature": true
+        },
+        "mixtral-8x7b-instruct": {
+          "id": "mistralai/mixtral-8x7b-instruct-v0.1",
+          "name": "Mixtral 8x7B",
+          "temperature": true
+        },
+        "mistral-large": {
+          "id": "mistralai/mistral-large",
+          "name": "Mistral Large",
+          "temperature": true
+        },
+        "mistral-nemotron": {
+          "id": "mistralai/mistral-nemotron",
+          "name": "Mistral Nemotron",
+          "temperature": true
+        },
+        "gemma-3-27b-it": {
+          "id": "google/gemma-3-27b-it",
+          "name": "Gemma 3 27B",
+          "temperature": true
+        },
+        "gemma-2-27b-it": {
+          "id": "google/gemma-2-27b-it",
+          "name": "Gemma 2 27B",
+          "temperature": true
+        },
+        "phi-4-mini-instruct": {
+          "id": "microsoft/phi-4-mini-instruct",
+          "name": "Phi-4 Mini",
+          "temperature": true
+        },
+        "qwen2.5-coder-32b": {
+          "id": "qwen/qwen2.5-coder-32b-instruct",
+          "name": "Qwen 2.5 Coder 32B",
+          "temperature": true
+        },
+        "deepseek-v3.2": {
+          "id": "deepseek-ai/deepseek-v3.2",
+          "name": "DeepSeek V3.2",
+          "temperature": true
+        }
+      }
+    },
+    "openrouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "{env:OPENROUTER_API_KEY}"
+      },
+      "models": {
+        "gemini-2.5-flash-exp:free": {
+          "id": "google/gemini-2.5-flash-exp:free",
+          "name": "Gemini 2.5 Flash (free)",
+          "temperature": true
+        },
+        "llama-3.2-3b-instruct:free": {
+          "id": "meta-llama/llama-3.2-3b-instruct:free",
+          "name": "Llama 3.2 3B (free)",
+          "temperature": true
+        },
+        "mistral-7b-instruct:free": {
+          "id": "mistralai/mistral-7b-instruct:free",
+          "name": "Mistral 7B (free)",
+          "temperature": true
+        },
+        "phi-3.5-mini-instruct:free": {
+          "id": "microsoft/phi-3.5-mini-instruct:free",
+          "name": "Phi-3.5 Mini (free)",
+          "temperature": true
+        }
+      }
+    },
+    "opencode": {
+      "description": "OpenCode built-in model infrastructure",
+      "models": {
+        "default": {
+          "id": "opencode/default",
+          "name": "OpenCode Default",
+          "temperature": true
+        },
+        "codex": {
+          "id": "opencode/codex",
+          "name": "OpenCode Codex",
+          "temperature": true
+        },
+        "mini": {
+          "id": "opencode/mini",
+          "name": "OpenCode Mini",
+          "temperature": true
+        }
+      }
+    }
+  },
+  "instructions": ["AGENTS.md"],
+  "watcher": {
+    "ignore": [
+      "node_modules/**",
+      "venv/**",
+      ".git/**",
+      "dist/**",
+      "build/**",
+      "*.log",
+      ".DS_Store",
+      "qdrant_storage/**",
+      ".ruff_cache/**",
+      "external/context-db-mcp/venv/**"
+    ]
+  },
+  "permission": {
+    "webfetch": "deny"
+  },
+  "compaction": {
+    "auto": true,
+    "prune": true
+  },
+  "agent": {
+    "coordinator": {
+      "description": "Coordination lead (user-defined). Choose the coordinator persona that fits your team.",
+      "mode": "primary",
+      "temperature": 0.2
+    },
+    "strategist": {
+      "description": "Systems architect for planning and decisions",
+      "mode": "subagent",
+      "model": "nvidia/llama-3.3-70b-instruct",
+      "temperature": 0.3,
+      "permission": {
+        "bash": "deny",
+        "write": "deny",
+        "edit": "deny"
+      }
+    },
+    "implementer": {
+      "description": "Implementation specialist for disciplined execution",
+      "mode": "subagent",
+      "model": "nvidia/qwen2.5-coder-32b",
+      "temperature": 0.4,
+      "permission": {
+        "webfetch": "allow"
+      }
+    },
+    "reviewer": {
+      "description": "Code and documentation reviewer for quality assurance",
+      "mode": "subagent",
+      "model": "nvidia/mistral-large",
+      "temperature": 0.2,
+      "permission": {
+        "bash": "deny",
+        "write": "deny",
+        "edit": "deny"
+      }
+    },
+    "research": {
+      "description": "Research lead for discovery and requirements",
+      "mode": "subagent",
+      "model": "nvidia/llama-3.3-70b-instruct",
+      "temperature": 0.2,
+      "permission": {
+        "webfetch": "allow",
+        "bash": "deny",
+        "write": "deny",
+        "edit": "deny"
+      }
+    },
+    "architect": {
+      "description": "Big-picture architect who shapes roadmaps and trade-offs",
+      "mode": "subagent",
+      "model": "nvidia/llama-3.3-70b-instruct",
+      "temperature": 0.3,
+      "permission": {
+        "bash": "deny",
+        "write": "deny",
+        "edit": "deny"
+      }
+    }
+  }
+}

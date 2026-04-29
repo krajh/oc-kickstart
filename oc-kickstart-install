@@ -1,0 +1,2334 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# oc-kickstart Installer (OpenCode configuration)
+# Supports: install, update, status, rollback, dry-run
+# WSL/Linux/macOS with cosign keyless verification
+
+show_logo() {
+  cat <<'EOF'
+   ___   ___  _____ _    _ _               _   
+  / _ \ / _ \|  ___| |  | | |             | |  
+ / /_\ \ /_\ \___ \| |  | | |__  __ _  ___| |_ 
+ |  _  |  _  |___) | |/\| | '_ \/ _` |/ __| __|
+ | | | | | | \____/ \  / /| | | | (_| | (__| |_ 
+ \_| |_\_| |_|     | \/ / |_| |_|\__,_|\___|\__|
+                                                 
+OpenCode Kickstart — Free Model Providers
+EOF
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_DIR="$HOME/.config/opencode"
+BACKUP_ROOT="$HOME/.config/opencode.backups"
+TIMESTAMP="$(date -u +%Y%m%d%H%M%SZ)"
+BACKUP_PATH="$BACKUP_ROOT/oc-kickstart-$TIMESTAMP"
+VERSIONS_DIR="$TARGET_DIR/versions"
+CURRENT_LINK="$TARGET_DIR/current"
+MANIFEST_FILE=".oc-kickstart-manifest.json"
+INCOMING_DIR=".oc-kickstart-incoming"
+
+# Top-level items that OpenCode reads from ~/.config/opencode.
+# We keep the real content in versions/<tag>/ and expose it via symlinks.
+KIT_LINK_ITEMS=(
+  "opencode.json"
+  "AGENTS.md"
+  "bunfig.toml"
+  "agents"
+  "plugins"
+  "protocols"
+  "skills"
+  "commands"
+)
+
+# Cosign configuration
+COSIGN_VERSION="v2.4.1"
+COSIGN_SHA256="8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b"
+COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+COSIGN_IDENTITY_PREFIX="https://github.com/krajh/oc-kickstart/.github/workflows/release.yml@refs/tags/"
+
+# Color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+log() {
+  printf "${BLUE}[oc-kickstart]${NC} %s\n" "$*" >&2
+}
+
+log_ok() {
+  printf "${GREEN}[OK]${NC} %s\n" "$*" >&2
+}
+
+log_warn() {
+  printf "${YELLOW}[!]${NC} %s\n" "$*" >&2
+}
+
+log_error() {
+  printf "${RED}[X]${NC} %s\n" "$*" >&2
+}
+
+die() {
+  log_error "$*"
+  exit 1
+}
+
+COMMAND="install"
+TAG="latest"
+DRY_RUN=false
+VERBOSE=false
+SKIP_VERIFY="${SKIP_VERIFY:-false}"
+NO_PROMPT=false
+PROVIDER_CHOICE=""
+INSTALL_FRIEREN="${INSTALL_FRIEREN:-}"  # "": ask interactively; "true": yes; "false": skip
+FRIEREN_DIR="${FRIEREN_DIR:-$HOME/dev/frieren}"
+INSTALL_SHADE="${INSTALL_SHADE:-}"      # "": ask interactively; "true": yes; "false": skip
+SHADE_DIR="${SHADE_DIR:-$HOME/.config/opencode/shade-pico}"
+CUSTOMIZE_MODELS="${CUSTOMIZE_MODELS:-}"  # "": ask interactively; "true": go straight to per-agent prompts; "false": use defaults
+
+# Auto-run detection: if no command given and no existing installation,
+# automatically run 'install' command
+if [ $# -eq 0 ]; then
+  TARGET_DIR_CHECK="$HOME/.config/opencode"
+  if [ ! -d "$TARGET_DIR_CHECK" ]; then
+    COMMAND="install"
+  fi
+fi
+
+# Parse flags anywhere; accept: <command> [tag]
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+  -v | --verbose)
+    VERBOSE=true
+    shift
+    ;;
+  -h | --help | help)
+    POSITIONAL=("help")
+    shift
+    ;;
+  --no-prompt)
+    NO_PROMPT=true
+    shift
+    ;;
+  --provider)
+    if [ -z "${2:-}" ]; then
+      die "--provider requires a value: nvidia, openrouter, or opencode"
+    fi
+    PROVIDER_CHOICE="$2"
+    shift 2
+    ;;
+  --frieren)
+    INSTALL_FRIEREN="true"
+    shift
+    ;;
+  --no-frieren)
+    INSTALL_FRIEREN="false"
+    shift
+    ;;
+  --shade)
+    INSTALL_SHADE="true"
+    shift
+    ;;
+  --no-shade)
+    INSTALL_SHADE="false"
+    shift
+    ;;
+  --models)
+    CUSTOMIZE_MODELS="true"
+    shift
+    ;;
+  --frieren-path)
+    if [ -z "${2:-}" ]; then
+      die "--frieren-path requires a value"
+    fi
+    FRIEREN_DIR="$2"
+    shift 2
+    ;;
+  --)
+    shift
+    break
+    ;;
+  *)
+    POSITIONAL+=("$1")
+    shift
+    ;;
+  esac
+done
+
+COMMAND="${POSITIONAL[0]:-install}"
+TAG="${POSITIONAL[1]:-latest}"
+
+get_env_file_key() {
+  local env_file="$TARGET_DIR/.env"
+  local key_name="${1:-NVIDIA_API_KEY}"
+
+  if [ ! -f "$env_file" ]; then
+    return 0
+  fi
+
+  local line
+  line="$(grep -E "^${key_name}=" "$env_file" 2>/dev/null | tail -1 || true)"
+  if [ -z "$line" ]; then
+    return 0
+  fi
+
+  printf "%s" "${line#${key_name}=}"
+}
+
+write_env_key() {
+  local key_name="$1"
+  local key_value="$2"
+  local env_file="$TARGET_DIR/.env"
+
+  if [ -L "$env_file" ]; then
+    die "Refusing to write to symlink: $env_file"
+  fi
+
+  mkdir -p "$TARGET_DIR"
+  touch "$env_file"
+  chmod 600 "$env_file" 2>/dev/null || true
+
+  local tmp
+  tmp="$(mktemp)"
+
+  # Copy existing .env while removing any prior entries for this key
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+    "${key_name}"=*)
+      continue
+      ;;
+    esac
+    printf "%s\n" "$line" >>"$tmp"
+  done <"$env_file"
+
+  printf "%s=%s\n" "$key_name" "$key_value" >>"$tmp"
+  mv "$tmp" "$env_file"
+  chmod 600 "$env_file" 2>/dev/null || true
+}
+
+# Append export statement to user's shell rc file
+add_to_rc_file() {
+  local key_name="$1"
+  local key_value="$2"
+
+  # Determine which rc file to use
+  local rc_file=""
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    rc_file="$HOME/.zshrc"
+  elif [ -n "${BASH_VERSION:-}" ]; then
+    rc_file="$HOME/.bashrc"
+  elif [ -f "$HOME/.zshrc" ]; then
+    rc_file="$HOME/.zshrc"
+  elif [ -f "$HOME/.bashrc" ]; then
+    rc_file="$HOME/.bashrc"
+  else
+    rc_file="$HOME/.profile"
+  fi
+
+  # Check if export already exists
+  if grep -qE "^export ${key_name}=" "$rc_file" 2>/dev/null; then
+    log "Export already exists in $rc_file"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Dry run: would add export ${key_name}=... to $rc_file"
+    return 0
+  fi
+
+  # Append export statement
+  printf "\nexport %s=\"%s\"\n" "$key_name" "$key_value" >>"$rc_file"
+  log_ok "Added export to $rc_file"
+}
+
+# ---------------------------------------------------------------------------
+# Provider selection and agent model configuration
+# ---------------------------------------------------------------------------
+
+validate_provider() {
+  case "$1" in
+  nvidia | openrouter | opencode) return 0 ;;
+  *) die "Invalid provider '$1'. Must be 'nvidia', 'openrouter', or 'opencode'." ;;
+  esac
+}
+
+# Returns the default model ID for a given provider + agent role.
+# Default agent models from NVIDIA (default provider).
+get_default_agent_model() {
+  local provider="$1" agent="$2"
+  case "$provider/$agent" in
+  nvidia/architect)   echo "nvidia/llama-3.3-70b-instruct" ;;
+  nvidia/strategist)  echo "nvidia/llama-3.3-70b-instruct" ;;
+  nvidia/implementer) echo "nvidia/qwen2.5-coder-32b" ;;
+  nvidia/reviewer)    echo "nvidia/mistral-large" ;;
+  nvidia/research)    echo "nvidia/llama-3.3-70b-instruct" ;;
+  openrouter/architect)   echo "openrouter/gemini-2.5-flash-exp:free" ;;
+  openrouter/strategist)  echo "openrouter/gemini-2.5-flash-exp:free" ;;
+  openrouter/implementer) echo "openrouter/gemini-2.5-flash-exp:free" ;;
+  openrouter/reviewer)    echo "openrouter/llama-3.2-3b-instruct:free" ;;
+  openrouter/research)    echo "openrouter/gemini-2.5-flash-exp:free" ;;
+  opencode/architect)   echo "opencode/default" ;;
+  opencode/strategist)  echo "opencode/default" ;;
+  opencode/implementer) echo "opencode/codex" ;;
+  opencode/reviewer)    echo "opencode/default" ;;
+  opencode/research)    echo "opencode/default" ;;
+  *)                   echo "" ;;
+  esac
+}
+
+get_provider_model_prefix() {
+  local provider="$1"
+  case "$provider" in
+  nvidia) echo "nvidia/" ;;
+  openrouter) echo "openrouter/" ;;
+  opencode) echo "opencode/" ;;
+  *) echo "" ;;
+  esac
+}
+
+is_model_for_provider() {
+  local provider="$1" model="$2"
+  local prefix
+  prefix="$(get_provider_model_prefix "$provider")"
+  [ -n "$prefix" ] && [[ "$model" == "$prefix"* ]]
+}
+
+# Prompt (or read saved values) to optionally customise per-agent model assignments.
+# Saves choices to .env as AGENT_MODEL_<NAME> for reuse on future updates.
+select_agent_models() {
+  local agents=("architect" "strategist" "implementer" "reviewer" "research")
+  local provider_prefix
+  provider_prefix="$(get_provider_model_prefix "$PROVIDER_CHOICE")"
+
+  # Load any previously saved per-agent overrides from .env
+  local -A saved_models=()
+  for agent in "${agents[@]}"; do
+    local key="AGENT_MODEL_$(echo "$agent" | tr '[:lower:]' '[:upper:]')"
+    local saved
+    saved="$(get_env_file_key "$key" || true)"
+    if [ -n "$saved" ] && is_model_for_provider "$PROVIDER_CHOICE" "$saved"; then
+      saved_models["$agent"]="$saved"
+    elif [ -n "$saved" ]; then
+      log_warn "Ignoring saved $key for provider '$PROVIDER_CHOICE' (expected prefix: ${provider_prefix:-<none>})"
+    fi
+  done
+
+  # Determine whether to customise
+  local do_customize=false
+
+  if [ "$CUSTOMIZE_MODELS" = "true" ]; then
+    do_customize=true
+  elif [ "$CUSTOMIZE_MODELS" = "false" ] || [ "$DRY_RUN" = true ] || [ "$NO_PROMPT" = true ] || [ ! -t 0 ]; then
+    do_customize=false
+  elif [ "${#saved_models[@]}" -gt 0 ]; then
+    # Saved overrides exist — ask whether to keep or reconfigure
+    printf "\n" >&2
+    printf "┌─────────────────────────────────────────────────────────────────┐\n" >&2
+    printf "│  Custom agent models are saved from a previous install.         │\n" >&2
+    printf "│  Reconfigure agent models? [y/N]                                │\n" >&2
+    printf "└─────────────────────────────────────────────────────────────────┘\n" >&2
+    printf "  Choice: " >&2
+    local answer
+    IFS= read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] && do_customize=true
+  else
+    # No saved overrides — offer customisation
+    printf "\n" >&2
+    printf "┌─────────────────────────────────────────────────────────────────┐\n" >&2
+    printf "│  Customise agent model assignments? [y/N]                       │\n" >&2
+    printf "│  (Press Enter to use smart defaults for $PROVIDER_CHOICE)       │\n" >&2
+    printf "└─────────────────────────────────────────────────────────────────┘\n" >&2
+    printf "  Choice: " >&2
+    local answer
+    IFS= read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] && do_customize=true
+  fi
+
+  if [ "$do_customize" = false ]; then
+    # Apply defaults (or saved overrides if they exist and user didn't reconfigure)
+    for agent in "${agents[@]}"; do
+      local key="AGENT_MODEL_$(echo "$agent" | tr '[:lower:]' '[:upper:]')"
+      if [ -n "${saved_models[$agent]:-}" ]; then
+        printf -v "AGENT_MODEL_${agent^^}" "%s" "${saved_models[$agent]}"
+        log "  $agent: ${saved_models[$agent]} (saved)"
+      else
+        local default
+        default="$(get_default_agent_model "$PROVIDER_CHOICE" "$agent")"
+        printf -v "AGENT_MODEL_${agent^^}" "%s" "$default"
+        log "  $agent: $default (default)"
+      fi
+    done
+    return 0
+  fi
+
+  # Interactive per-agent customisation
+  printf "\n" >&2
+  printf "╔══════════════════════════════════════════════════════════════╗\n" >&2
+  printf "║  Agent Model Configuration                                   ║\n" >&2
+  printf "║  Provider: %-49s║\n" "$PROVIDER_CHOICE" >&2
+  printf "║  Press Enter to accept the default for each agent.           ║\n" >&2
+  printf "╚══════════════════════════════════════════════════════════════╝\n" >&2
+  printf "\n" >&2
+
+  for agent in "${agents[@]}"; do
+    local default
+    default="$(get_default_agent_model "$PROVIDER_CHOICE" "$agent")"
+    local current="${saved_models[$agent]:-$default}"
+    local key="AGENT_MODEL_$(echo "$agent" | tr '[:lower:]' '[:upper:]')"
+
+    printf "  %-12s [default: %s]\n" "$agent" "$current" >&2
+    printf "  Model: " >&2
+    local choice
+    IFS= read -r choice
+
+    local selected
+    if [ -z "$choice" ]; then
+      selected="$current"
+    else
+      selected="$choice"
+    fi
+
+    printf -v "AGENT_MODEL_${agent^^}" "%s" "$selected"
+    [ "$DRY_RUN" != true ] && write_env_key "$key" "$selected"
+    log_ok "  $agent → $selected"
+  done
+}
+
+# Prompt (or read saved value) to choose model provider
+select_provider() {
+  local env_provider
+  env_provider="$(get_env_file_key "MODEL_PROVIDER" || true)"
+
+  # Env var override takes priority
+  if [ -n "${MODEL_PROVIDER:-}" ]; then
+    PROVIDER_CHOICE="${MODEL_PROVIDER}"
+    validate_provider "$PROVIDER_CHOICE"
+    [ "$DRY_RUN" != true ] && write_env_key "MODEL_PROVIDER" "$PROVIDER_CHOICE"
+    log_ok "Provider (from env): $PROVIDER_CHOICE"
+    return 0
+  fi
+
+  # --provider flag already set
+  if [ -n "$PROVIDER_CHOICE" ]; then
+    validate_provider "$PROVIDER_CHOICE"
+    [ "$DRY_RUN" != true ] && write_env_key "MODEL_PROVIDER" "$PROVIDER_CHOICE"
+    log_ok "Provider (from flag): $PROVIDER_CHOICE"
+    return 0
+  fi
+
+  # Already persisted in .env
+  if [ -n "$env_provider" ]; then
+    PROVIDER_CHOICE="$env_provider"
+    log_ok "Provider (saved): $PROVIDER_CHOICE"
+    return 0
+  fi
+
+  # Dry run default
+  if [ "$DRY_RUN" = true ]; then
+    PROVIDER_CHOICE="nvidia"
+    log "Dry run: defaulting provider to nvidia"
+    return 0
+  fi
+
+  if [ "$NO_PROMPT" = true ] || [ ! -t 0 ]; then
+    die "MODEL_PROVIDER not set. Use --provider nvidia|openrouter|opencode or set the MODEL_PROVIDER env var."
+  fi
+
+  printf "\n" >&2
+  printf "╔══════════════════════════════════════════════════════════════╗\n" >&2
+  printf "║  Model Provider Selection                                    ║\n" >&2
+  printf "╠══════════════════════════════════════════════════════════════╣\n" >&2
+  printf "║  1) nvidia     — NVIDIA NIM API (free tier, default)        ║\n" >&2
+  printf "║                  Requires NVIDIA_API_KEY env var             ║\n" >&2
+  printf "║  2) openrouter — OpenRouter API with free models            ║\n" >&2
+  printf "║                  Requires OPENROUTER_API_KEY env var         ║\n" >&2
+  printf "║  3) opencode   — OpenCode built-in model infrastructure     ║\n" >&2
+  printf "║                  No API key required                         ║\n" >&2
+  printf "╚══════════════════════════════════════════════════════════════╝\n" >&2
+  printf "\n" >&2
+
+  local choice
+  while true; do
+    printf "Select provider [1/2/3] (default: 1): " >&2
+    IFS= read -r choice
+    case "${choice:-1}" in
+    1 | nvidia)
+      PROVIDER_CHOICE="nvidia"
+      break
+      ;;
+    2 | openrouter)
+      PROVIDER_CHOICE="openrouter"
+      break
+      ;;
+    3 | opencode)
+      PROVIDER_CHOICE="opencode"
+      break
+      ;;
+    *)
+      log_warn "Enter 1 (nvidia), 2 (openrouter), or 3 (opencode)"
+      ;;
+    esac
+  done
+
+  write_env_key "MODEL_PROVIDER" "$PROVIDER_CHOICE"
+  log_ok "Provider selected: $PROVIDER_CHOICE"
+}
+
+# Patch opencode.json in version_dir with per-agent model IDs.
+# Must be called AFTER select_agent_models and BEFORE compute_manifest
+# so the patched state is the baseline for future update detection.
+configure_agent_models() {
+  local version_dir="$1"
+  local json_file="$version_dir/opencode.json"
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Dry run: would configure agent models for provider=$PROVIDER_CHOICE"
+    return 0
+  fi
+
+  if [ ! -f "$json_file" ]; then
+    log_warn "opencode.json not found at $json_file — skipping model configuration"
+    return 0
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    log_warn "jq not found — skipping automatic agent model configuration"
+    log_warn "Install jq and re-run, or manually set agent models in $json_file"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+
+  jq \
+    --arg architect   "${AGENT_MODEL_ARCHITECT:-}" \
+    --arg strategist  "${AGENT_MODEL_STRATEGIST:-}" \
+    --arg implementer "${AGENT_MODEL_IMPLEMENTER:-}" \
+    --arg reviewer    "${AGENT_MODEL_REVIEWER:-}" \
+    --arg research    "${AGENT_MODEL_RESEARCH:-}" \
+    '.agent.architect.model   = $architect   |
+     .agent.strategist.model  = $strategist  |
+     .agent.implementer.model = $implementer |
+     .agent.reviewer.model    = $reviewer    |
+     .agent.research.model    = $research' \
+    "$json_file" >"$tmp"
+
+  mv "$tmp" "$json_file"
+  log_ok "Agent models configured:"
+  log "  architect:   ${AGENT_MODEL_ARCHITECT:-}"
+  log "  strategist:  ${AGENT_MODEL_STRATEGIST:-}"
+  log "  implementer: ${AGENT_MODEL_IMPLEMENTER:-}"
+  log "  reviewer:    ${AGENT_MODEL_REVIEWER:-}"
+  log "  research:    ${AGENT_MODEL_RESEARCH:-}"
+}
+
+ensure_nvidia_key() {
+  local env_key file_key env_base_url file_base_url
+  env_key="${NVIDIA_API_KEY:-}"
+  file_key="$(get_env_file_key "NVIDIA_API_KEY" || true)"
+  env_base_url="${BASE_URL:-}"
+  file_base_url="$(get_env_file_key "BASE_URL" || true)"
+
+  # Check if we can prompt interactively
+  local can_prompt=false
+  if [ "$DRY_RUN" != true ] && [ "$NO_PROMPT" != true ] && [ -t 0 ]; then
+    can_prompt=true
+  fi
+
+  # Handle NVIDIA_API_KEY
+  if [ -n "$env_key" ]; then
+    # Present in environment, persist it
+    if [ "$DRY_RUN" = true ]; then
+      log "Dry run: would persist NVIDIA_API_KEY to $TARGET_DIR/.env"
+    elif [ "$file_key" != "$env_key" ]; then
+      log "Persisting NVIDIA_API_KEY to $TARGET_DIR/.env"
+      write_env_key "NVIDIA_API_KEY" "$env_key"
+      add_to_rc_file "NVIDIA_API_KEY" "$env_key"
+    fi
+  elif [ -n "$file_key" ]; then
+    # Already configured in .env — keep it silently
+    log_ok "NVIDIA_API_KEY already configured (use 'write_env_key NVIDIA_API_KEY <value>' to change)"
+  fi
+
+  # Prompt for NVIDIA_API_KEY if still needed
+  if [ -z "$env_key" ] && [ -z "$file_key" ]; then
+    if [ "$DRY_RUN" = true ]; then
+      log_warn "Dry run: NVIDIA_API_KEY missing; would prompt and write to $TARGET_DIR/.env"
+    elif [ "$NO_PROMPT" = true ]; then
+      die "NVIDIA_API_KEY is not set and no value found in $TARGET_DIR/.env. Prompting disabled (--no-prompt). Set env var NVIDIA_API_KEY or add it to $TARGET_DIR/.env."
+    elif [ ! -t 0 ]; then
+      die "NVIDIA_API_KEY is not set and no value found in $TARGET_DIR/.env. Non-interactive session: set env var NVIDIA_API_KEY or add it to $TARGET_DIR/.env."
+    else
+      # Interactive prompt
+      log_warn "Configuration required"
+      printf "\n" >&2
+      printf "╔══════════════════════════════════════════════════════════════╗\n" >&2
+      printf "║  oc-kickstart Configuration                                        ║\n" >&2
+      printf "╠══════════════════════════════════════════════════════════════╣\n" >&2
+      printf "║  Please enter your NVIDIA_API_KEY (API key)                    ║\n" >&2
+      printf "║  Input will be hidden for security                           ║\n" >&2
+      printf "╚══════════════════════════════════════════════════════════════╝\n" >&2
+      printf "\n" >&2
+
+      local entered
+      entered=""
+      while [ -z "$entered" ]; do
+        printf "NVIDIA_API_KEY: " >&2
+        IFS= read -r -s entered
+        printf "\n" >&2
+
+        if [ -z "$entered" ]; then
+          log_warn "NVIDIA_API_KEY cannot be empty. Please try again."
+        fi
+      done
+
+      write_env_key "NVIDIA_API_KEY" "$entered"
+      log_ok "✓ Saved NVIDIA_API_KEY to $TARGET_DIR/.env"
+      add_to_rc_file "NVIDIA_API_KEY" "$entered"
+      env_key="$entered"
+    fi
+  fi
+
+  # Handle BASE_URL (optional)
+  if [ -n "$env_base_url" ]; then
+    # Present in environment, persist it
+    if [ "$DRY_RUN" = true ]; then
+      log "Dry run: would persist BASE_URL to $TARGET_DIR/.env"
+    elif [ "$file_base_url" != "$env_base_url" ]; then
+      log "Persisting BASE_URL to $TARGET_DIR/.env"
+      write_env_key "BASE_URL" "$env_base_url"
+      add_to_rc_file "BASE_URL" "$env_base_url"
+    fi
+  elif [ -n "$file_base_url" ]; then
+    # Already configured in .env — keep it silently
+    log_ok "BASE_URL already configured: $file_base_url"
+  fi
+
+  # Prompt for BASE_URL if not set and we're interactive
+  if [ -z "$env_base_url" ] && [ -z "$file_base_url" ] && [ "$can_prompt" = true ]; then
+    printf "\n" >&2
+    printf "BASE_URL (optional - press Enter to use default): " >&2
+    local entered_url
+    IFS= read -r entered_url
+
+    if [ -n "$entered_url" ]; then
+      write_env_key "BASE_URL" "$entered_url"
+      add_to_rc_file "BASE_URL" "$entered_url"
+      log_ok "✓ Saved BASE_URL to $TARGET_DIR/.env"
+    else
+      log "Using default BASE_URL from configuration"
+    fi
+  fi
+}
+
+ensure_openrouter_key() {
+  local env_key file_key
+  env_key="${OPENROUTER_API_KEY:-}"
+  file_key="$(get_env_file_key "OPENROUTER_API_KEY" || true)"
+
+  local can_prompt=false
+  if [ "$DRY_RUN" != true ] && [ "$NO_PROMPT" != true ] && [ -t 0 ]; then
+    can_prompt=true
+  fi
+
+  if [ -n "$env_key" ]; then
+    if [ "$DRY_RUN" = true ]; then
+      log "Dry run: would persist OPENROUTER_API_KEY to $TARGET_DIR/.env"
+    elif [ "$file_key" != "$env_key" ]; then
+      log "Persisting OPENROUTER_API_KEY to $TARGET_DIR/.env"
+      write_env_key "OPENROUTER_API_KEY" "$env_key"
+      add_to_rc_file "OPENROUTER_API_KEY" "$env_key"
+    fi
+    return 0
+  fi
+
+  if [ -n "$file_key" ]; then
+    log_ok "OPENROUTER_API_KEY already configured"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    log_warn "Dry run: OPENROUTER_API_KEY missing; would prompt"
+    return 0
+  fi
+
+  if [ "$NO_PROMPT" = true ] || [ ! -t 0 ]; then
+    log_warn "OPENROUTER_API_KEY is not set. Set env var OPENROUTER_API_KEY or add it to $TARGET_DIR/.env."
+    return 0
+  fi
+
+  log_warn "OpenRouter API key required"
+  printf "\n" >&2
+  printf "╔══════════════════════════════════════════════════════════════╗\n" >&2
+  printf "║  OpenRouter API Key                                          ║\n" >&2
+  printf "╠══════════════════════════════════════════════════════════════╣\n" >&2
+  printf "║  Please enter your OPENROUTER_API_KEY                        ║\n" >&2
+  printf "║  Input will be hidden for security                           ║\n" >&2
+  printf "╚══════════════════════════════════════════════════════════════╝\n" >&2
+  printf "\n" >&2
+
+  local entered=""
+  while [ -z "$entered" ]; do
+    printf "OPENROUTER_API_KEY: " >&2
+    IFS= read -r -s entered
+    printf "\n" >&2
+    if [ -z "$entered" ]; then
+      log_warn "OPENROUTER_API_KEY cannot be empty. Please try again."
+    fi
+  done
+
+  write_env_key "OPENROUTER_API_KEY" "$entered"
+  log_ok "Saved OPENROUTER_API_KEY to $TARGET_DIR/.env"
+  add_to_rc_file "OPENROUTER_API_KEY" "$entered"
+}
+
+# ---------------------------------------------------------------------------
+# Frieren MCP server — optional local AI memory layer
+# ---------------------------------------------------------------------------
+
+check_frieren_in_config() {
+  local config="$TARGET_DIR/opencode.json"
+  [ -f "$config" ] || { echo "absent"; return; }
+  if command -v jq &>/dev/null; then
+    if jq -e '.mcp.frieren' "$config" &>/dev/null; then
+      echo "configured"
+    else
+      echo "absent"
+    fi
+  else
+    # grep fallback
+    if grep -q '"mcp"' "$config" 2>/dev/null && grep -q '"frieren"' "$config" 2>/dev/null; then
+      echo "configured"
+    else
+      echo "absent"
+    fi
+  fi
+}
+
+install_frieren_server() {
+  if ! command -v git &>/dev/null; then
+    log_warn "git not found — skipping Frieren server install"
+    return 1
+  fi
+  if ! command -v bun &>/dev/null; then
+    log_warn "bun not found — skipping Frieren server install"
+    return 1
+  fi
+  if [ -d "$FRIEREN_DIR/.git" ]; then
+    log "Updating Frieren server at $FRIEREN_DIR..."
+    if [ "$DRY_RUN" != true ]; then
+      git -C "$FRIEREN_DIR" pull --ff-only
+    else
+      log "[dry-run] git -C $FRIEREN_DIR pull --ff-only"
+    fi
+  else
+    log "Cloning Frieren server to $FRIEREN_DIR..."
+    if [ "$DRY_RUN" != true ]; then
+      git clone https://github.com/krajh/frieren.git "$FRIEREN_DIR"
+    else
+      log "[dry-run] git clone https://github.com/krajh/frieren.git $FRIEREN_DIR"
+    fi
+  fi
+  log "Installing Frieren dependencies..."
+  if [ "$DRY_RUN" != true ]; then
+    bun install --cwd "$FRIEREN_DIR"
+    # On Linux, sharp (transitive dep of @xenova/transformers) requires a prebuilt native binary.
+    # bun install does not build native modules by default, so install the prebuilt binary explicitly.
+    if [ "$(uname -s)" = "Linux" ] && command -v npm &>/dev/null; then
+      log "Installing sharp prebuilt binary for Linux..."
+      npm install --prefix "$FRIEREN_DIR" --platform=linux --arch=x64 sharp@0.32.6 --silent \
+        || log_warn "sharp install failed — if Frieren fails to start, run: npm install --platform=linux --arch=x64 sharp@0.32.6"
+    fi
+  else
+    log "[dry-run] bun install --cwd $FRIEREN_DIR"
+    log "[dry-run] npm install --platform=linux --arch=x64 sharp@0.32.6 (Linux only)"
+  fi
+}
+
+configure_frieren_in_opencode() {
+  if ! command -v jq &>/dev/null; then
+    log_warn "jq not found — add Frieren manually to opencode.json:"
+    log_warn '    "mcp": { "frieren": { "type": "local", "command": ["bun", "'"$FRIEREN_DIR"'/src/index.ts"], "enabled": true } }'
+    return
+  fi
+  # Resolve symlink so we write the real file, not the symlink itself.
+  # readlink -f is GNU-only; fall back to perl (available on macOS) then no-op.
+  local real_config
+  real_config="$(readlink -f "$TARGET_DIR/opencode.json" 2>/dev/null \
+    || perl -MCwd -e 'print Cwd::abs_path(shift)' "$TARGET_DIR/opencode.json" 2>/dev/null \
+    || echo "$TARGET_DIR/opencode.json")"
+  if [ ! -f "$real_config" ]; then
+    log_warn "opencode.json not found at $real_config — skipping Frieren config"
+    return
+  fi
+  log "Configuring Frieren in opencode.json..."
+  if [ "$DRY_RUN" != true ]; then
+    local tmp
+    tmp="$(mktemp)"
+    jq --arg path "$FRIEREN_DIR/src/index.ts" \
+      '.mcp.frieren = {"type":"local","command":["bun",$path],"enabled":true}' \
+      "$real_config" > "$tmp" && mv "$tmp" "$real_config"
+    log_ok "✓ Frieren configured in $real_config"
+  else
+    log "[dry-run] jq-patch .mcp.frieren into $real_config"
+  fi
+}
+
+ensure_frieren() {
+  [ "$INSTALL_FRIEREN" = "false" ] && return
+
+  local frieren_status
+  frieren_status="$(check_frieren_in_config)"
+  local repo_exists=false
+  [ -d "$FRIEREN_DIR/.git" ] && repo_exists=true
+
+  # Already fully installed — offer update or skip
+  if [ "$frieren_status" = "configured" ] && [ "$repo_exists" = true ]; then
+    if [ "$INSTALL_FRIEREN" = "true" ] || [ "$DRY_RUN" = true ]; then
+      install_frieren_server || log_warn "Frieren update failed (retry manually)"
+      return
+    fi
+    if [ "$NO_PROMPT" = true ] || [ ! -t 0 ]; then
+      return
+    fi
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────────────┐"
+    echo "│  Frieren (local AI memory) is already installed.                │"
+    echo "│  Update to latest? [y/N]                                        │"
+    echo "└─────────────────────────────────────────────────────────────────┘"
+    printf "  Choice: "
+    local answer
+    IFS= read -r answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      install_frieren_server || log_warn "Frieren update failed (retry manually)"
+    fi
+    return
+  fi
+
+  # Not installed — ask or proceed based on flag
+  if [ "$INSTALL_FRIEREN" != "true" ] && [ "$DRY_RUN" != true ]; then
+    if [ "$NO_PROMPT" = true ] || [ ! -t 0 ]; then
+      return
+    fi
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────────────┐"
+    echo "│  Install Frieren — local AI memory layer for OpenCode?          │"
+    echo "│  Fully local. No API keys required.                             │"
+    echo "│  First run downloads ~23 MB to ~/.cache/                        │"
+    echo "│  [y/N]                                                          │"
+    echo "└─────────────────────────────────────────────────────────────────┘"
+    printf "  Choice: "
+    local answer
+    IFS= read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return
+  fi
+
+  install_frieren_server || return
+  configure_frieren_in_opencode
+}
+
+# ---------------------------------------------------------------------------
+# Shade — Reaper Realm background executor (optional)
+# ---------------------------------------------------------------------------
+
+install_shade_files() {
+  local kit_shade_dir="$SCRIPT_DIR/shade"
+  if [ ! -d "$kit_shade_dir" ]; then
+    log_warn "Shade files not found in kit at $kit_shade_dir — skipping"
+    return 1
+  fi
+
+  log "Installing Shade harness to $SHADE_DIR..."
+  if [ "$DRY_RUN" != true ]; then
+    mkdir -p "$SHADE_DIR/extensions/peerage"
+    cp "$kit_shade_dir/AGENTS.md" "$SHADE_DIR/AGENTS.md"
+    cp "$kit_shade_dir/shade-launcher.sh" "$SHADE_DIR/shade-launcher.sh"
+    cp "$kit_shade_dir/shade-tmux.sh" "$SHADE_DIR/shade-tmux.sh"
+    cp "$kit_shade_dir/extensions/reaper.ts" "$SHADE_DIR/extensions/reaper.ts"
+    cp "$kit_shade_dir/extensions/peerage/peerage.ts" "$SHADE_DIR/extensions/peerage/peerage.ts"
+    chmod +x "$SHADE_DIR/shade-launcher.sh" "$SHADE_DIR/shade-tmux.sh"
+  else
+    log "[dry-run] cp shade/* → $SHADE_DIR"
+  fi
+}
+
+install_shade_aliases() {
+  local zshrc="$HOME/.zshrc"
+  if [ ! -f "$zshrc" ]; then
+    log_warn "~/.zshrc not found — add Shade aliases manually"
+    return
+  fi
+  if grep -q "shade-pico" "$zshrc" 2>/dev/null; then
+    log "Shade aliases already in ~/.zshrc"
+    return
+  fi
+  if [ "$DRY_RUN" != true ]; then
+    cat >> "$zshrc" << 'ALIASES'
+
+# Shade — Reaper Realm executor (autostart)
+if ! tmux has-session -t shade 2>/dev/null; then
+  ~/.config/opencode/shade-pico/shade-tmux.sh start &>/dev/null &
+fi
+alias shade='tmux attach -t shade'
+alias shade-start='~/.config/opencode/shade-pico/shade-tmux.sh start'
+alias shade-stop='~/.config/opencode/shade-pico/shade-tmux.sh stop'
+alias shade-status='~/.config/opencode/shade-pico/shade-tmux.sh status'
+ALIASES
+    log_ok "✓ Shade aliases added to ~/.zshrc"
+  else
+    log "[dry-run] Append Shade aliases to ~/.zshrc"
+  fi
+}
+
+check_shade_installed() {
+  if [ -f "$SHADE_DIR/shade-launcher.sh" ] && [ -f "$SHADE_DIR/extensions/reaper.ts" ]; then
+    echo "installed"
+  else
+    echo "absent"
+  fi
+}
+
+check_pi_installed() {
+  if command -v pi &>/dev/null; then
+    echo "installed"
+  else
+    echo "absent"
+  fi
+}
+
+ensure_shade() {
+  [ "$INSTALL_SHADE" = "false" ] && return
+
+  local shade_status
+  shade_status="$(check_shade_installed)"
+
+  # Already installed — offer update or skip
+  if [ "$shade_status" = "installed" ]; then
+    if [ "$INSTALL_SHADE" = "true" ] || [ "$DRY_RUN" = true ]; then
+      install_shade_files || log_warn "Shade update failed"
+      return
+    fi
+    if [ "$NO_PROMPT" = true ] || [ ! -t 0 ]; then
+      return
+    fi
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────────────┐"
+    echo "│  Shade (Reaper Realm executor) is already installed.            │"
+    echo "│  Update to latest? [y/N]                                        │"
+    echo "└─────────────────────────────────────────────────────────────────┘"
+    printf "  Choice: "
+    local answer
+    IFS= read -r answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      install_shade_files || log_warn "Shade update failed"
+    fi
+    return
+  fi
+
+  # Not installed — ask or proceed based on flag
+  if [ "$INSTALL_SHADE" != "true" ] && [ "$DRY_RUN" != true ]; then
+    if [ "$NO_PROMPT" = true ] || [ ! -t 0 ]; then
+      return
+    fi
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────────────┐"
+    echo "│  Install Shade — background task executor for OpenCode?         │"
+    echo "│  Requires: Frieren (queue tools) + Pi runtime + tmux           │"
+    echo "│  [y/N]                                                          │"
+    echo "└─────────────────────────────────────────────────────────────────┘"
+    printf "  Choice: "
+    local answer
+    IFS= read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return
+  fi
+
+  # Check prerequisites
+  local pi_status
+  pi_status="$(check_pi_installed)"
+  if [ "$pi_status" = "absent" ]; then
+    log_warn "Pi runtime not found. Install it first:"
+    log_warn "  npm install -g @mariozechner/pi-coding-agent"
+    if [ "$DRY_RUN" != true ]; then
+      return
+    fi
+  fi
+
+  if ! command -v tmux &>/dev/null; then
+    log_warn "tmux not found. Install it first (apt/brew install tmux)"
+    if [ "$DRY_RUN" != true ]; then
+      return
+    fi
+  fi
+
+  install_shade_files || return
+  install_shade_aliases
+  log_ok "Shade installed. Start with: shade-start (or open a new shell)"
+}
+
+configure_opencode_mem() {
+  local config_file="$TARGET_DIR/opencode-mem.jsonc"
+
+  if [ -f "$config_file" ]; then
+    log "opencode-mem.jsonc already exists — preserving existing config."
+    return
+  fi
+
+  log "Writing opencode-mem.jsonc to $config_file..."
+  if [ "$DRY_RUN" = true ]; then
+    log "[dry-run] Would write $config_file"
+    return
+  fi
+
+  cat > "$config_file" << 'OPENCODE_MEM_CONFIG'
+{
+  "storagePath": "~/.opencode-mem/data",
+  "maxVectorsPerShard": 50000,
+  "embeddingModel": "Xenova/nomic-embed-text-v1",
+  "embeddingDimensions": 768,
+  "embeddingApiUrl": "",
+  "embeddingApiKey": "",
+  "webServerEnabled": true,
+  "webServerPort": 4748,
+  "webServerHost": "127.0.0.1",
+  "autoCaptureEnabled": true,
+  "autoCaptureLanguage": "auto",
+  "memoryProvider": "openai-chat",
+  "memoryModel": "meta/llama-3.3-70b-instruct",
+  "memoryApiUrl": "https://integrate.api.nvidia.com/v1",
+  "memoryApiKey": "env://NVIDIA_API_KEY",
+  "memoryTemperature": 0.3,
+  "userProfileAnalysisInterval": 10,
+  "userProfileMaxPreferences": 20,
+  "userProfileMaxPatterns": 15,
+  "userProfileMaxWorkflows": 10,
+  "userProfileConfidenceDecayDays": 30,
+  "userProfileChangelogRetentionCount": 5,
+  "autoCaptureMaxIterations": 5,
+  "autoCaptureIterationTimeout": 30000,
+  "similarityThreshold": 0.65,
+  "maxMemories": 15,
+  "autoCleanupEnabled": true,
+  "autoCleanupRetentionDays": 90,
+  "deduplicationEnabled": true,
+  "deduplicationSimilarityThreshold": 0.85,
+  "compaction": {
+    "enabled": true,
+    "memoryLimit": 200
+  },
+  "showAutoCaptureToasts": false,
+  "showUserProfileToasts": false,
+  "showErrorToasts": true,
+  "injectProfile": true,
+  "keywordPatterns": [
+    "auth", "migration", "test", "vitest", "typescript", "react",
+    "wallet", "security", "modal", "permission", "worktree", "api",
+    "docker", "coinburn", "skill", "deploy"
+  ],
+  "containerTagPrefix": "opencode",
+  "maxProfileItems": 10,
+  "chatMessage": {
+    "enabled": true,
+    "maxMemories": 5,
+    "excludeCurrentSession": true,
+    "injectOn": "first"
+  }
+}
+OPENCODE_MEM_CONFIG
+
+  log_ok "✓ opencode-mem.jsonc written to $config_file"
+}
+
+# Detect OS and architecture
+detect_platform() {
+  local os kernel arch
+
+  os="$(uname -s)"
+  kernel="$(uname -r)"
+  arch="$(uname -m)"
+
+  # Check for WSL
+  if grep -qi microsoft /proc/version 2>/dev/null || grep -qi wsl /proc/version 2>/dev/null; then
+    log_ok "Detected WSL environment"
+    PLATFORM_OS="linux"
+  elif [ "$os" = "Linux" ]; then
+    log_ok "Detected Linux environment"
+    PLATFORM_OS="linux"
+  elif [ "$os" = "Darwin" ]; then
+    log_ok "Detected macOS environment"
+    PLATFORM_OS="darwin"
+  else
+    die "This installer only supports WSL, Linux, and macOS. Detected: $os"
+  fi
+
+  # Check architecture
+  if [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ] && [ "$arch" != "arm64" ]; then
+    die "This installer only supports x86_64/amd64/arm64 architecture. Detected: $arch"
+  fi
+
+  # Normalize architecture for cosign binary selection
+  if [ "$arch" = "x86_64" ] || [ "$arch" = "amd64" ]; then
+    PLATFORM_ARCH="amd64"
+  elif [ "$arch" = "arm64" ]; then
+    PLATFORM_ARCH="arm64"
+  fi
+
+  log "Platform: $os $kernel ($arch)"
+}
+
+# Check prerequisites
+check_prerequisites() {
+  local missing=()
+
+  for cmd in curl tar mkdir; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if [ ${#missing[@]} -gt 0 ]; then
+    die "Missing required commands: ${missing[*]}. Please install them and try again."
+  fi
+
+  log_ok "All prerequisites found"
+}
+
+# Detect and install OpenCode CLI if not present
+ensure_opencode() {
+  # Check if OpenCode is installed
+  if command -v opencode >/dev/null 2>&1; then
+    local current_version
+    current_version="$(opencode --version 2>/dev/null || echo "unknown")"
+    log_ok "OpenCode CLI found (version: $current_version)"
+    return 0
+  fi
+
+  # OpenCode not found - offer to install
+  local can_prompt=false
+  if [ "$DRY_RUN" != true ] && [ "$NO_PROMPT" != true ] && [ -t 0 ]; then
+    can_prompt=true
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Dry run: would install OpenCode CLI"
+    return 0
+  fi
+
+  if [ "$NO_PROMPT" = true ] && [ "$can_prompt" = false ]; then
+    die "OpenCode CLI is not installed and --no-prompt is set. Install OpenCode first: https://opencode.ai"
+  fi
+
+  if [ "$can_prompt" = true ]; then
+    printf "\n" >&2
+    printf "╔══════════════════════════════════════════════════════════════╗\n" >&2
+    printf "║  OpenCode CLI Not Found                                     ║\n" >&2
+    printf "╠══════════════════════════════════════════════════════════════╣\n" >&2
+    printf "║  OpenCode is required to use this kit.                      ║\n" >&2
+    printf "║  Install now? [Y/n]:                                        ║\n" >&2
+    printf "╚══════════════════════════════════════════════════════════════╝\n" >&2
+    printf "\n" >&2
+
+    local response
+    printf "Install OpenCode? [Y/n]: " >&2
+    IFS= read -r response
+    printf "\n" >&2
+
+    if [[ "$response" =~ ^[Nn]$ ]]; then
+      die "OpenCode CLI is required. Install from: https://opencode.ai"
+    fi
+  fi
+
+  # Install OpenCode CLI
+  log "Installing OpenCode CLI..."
+
+  local install_script
+  install_script="$(mktemp)"
+
+  # Detect platform for installation
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  if [ "$arch" = "x86_64" ] || [ "$arch" = "amd64" ]; then
+    arch="x86_64"
+  elif [ "$arch" = "arm64" ]; then
+    arch="aarch64"
+  fi
+
+  # Download and run OpenCode install script
+  local opencode_install_url="https://opencode.ai/install"
+  
+  if ! curl -fsSL "$opencode_install_url" -o "$install_script"; then
+    rm -f "$install_script"
+    die "Failed to download OpenCode installer"
+  fi
+
+  chmod +x "$install_script"
+
+  # Run the installer
+  if ! "$install_script" --prefix "$TARGET_DIR/bin" 2>&1; then
+    rm -f "$install_script"
+    die "OpenCode installation failed"
+  fi
+
+  rm -f "$install_script"
+
+  # Add to PATH for current session
+  export PATH="$TARGET_DIR/bin:$PATH"
+
+  # Verify installation
+  if ! command -v opencode >/dev/null 2>&1; then
+    die "OpenCode installed but not found in PATH. Add $TARGET_DIR/bin to your PATH."
+  fi
+
+  local installed_version
+  installed_version="$(opencode --version 2>/dev/null || echo "unknown")"
+  log_ok "OpenCode CLI installed (version: $installed_version)"
+}
+
+# Download cosign binary if needed
+ensure_cosign() {
+  local cosign_bin cosign_url cosign_binary_name
+
+  cosign_bin="$TARGET_DIR/bin/cosign"
+
+  # Determine the correct cosign binary based on platform
+  cosign_binary_name="cosign-${PLATFORM_OS}-${PLATFORM_ARCH}"
+  cosign_url="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${cosign_binary_name}"
+
+  if [ -x "$cosign_bin" ]; then
+    echo "$cosign_bin"
+    return 0
+  fi
+
+  mkdir -p "$TARGET_DIR/bin"
+  local tmp
+  tmp="$(mktemp)"
+
+  log "Downloading cosign ${COSIGN_VERSION} for ${PLATFORM_OS}/${PLATFORM_ARCH}..."
+
+  if ! curl -fsSL "$cosign_url" -o "$tmp"; then
+    rm -f "$tmp"
+    die "Failed to download cosign from $cosign_url"
+  fi
+
+  # Note: SHA256 verification skipped for non-linux platforms
+  # The pinned hash (COSIGN_SHA256) is specifically for cosign-linux-amd64
+  if [ "$PLATFORM_OS" = "linux" ] && [ "$PLATFORM_ARCH" = "amd64" ]; then
+    local actual_sha
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual_sha="$(sha256sum "$tmp" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      actual_sha="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+    else
+      log_warn "sha256sum/shasum not found, skipping cosign hash verification"
+      actual_sha="$COSIGN_SHA256"
+    fi
+
+    if [ "$actual_sha" != "$COSIGN_SHA256" ]; then
+      rm -f "$tmp"
+      die "cosign sha256 mismatch (expected pinned hash)"
+    fi
+  else
+    log_warn "Skipping cosign SHA256 verification for ${PLATFORM_OS}/${PLATFORM_ARCH} (pinned hash is linux-amd64 specific)"
+  fi
+
+  if ! chmod +x "$tmp" || ! "$tmp" version >/dev/null 2>&1; then
+    rm -f "$tmp"
+    die "Downloaded cosign binary is invalid"
+  fi
+
+  mv "$tmp" "$cosign_bin"
+
+  log_ok "cosign ${COSIGN_VERSION} ready"
+  echo "$cosign_bin"
+}
+
+# Verify tarball signature with cosign keyless
+verify_tarball() {
+  local tarball="$1" bundle="$2" tag="$3" cosign_bin expected_identity
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Dry run: would verify signature for $tarball"
+    return 0
+  fi
+
+  if [ "$SKIP_VERIFY" = "true" ]; then
+    log_warn "Signature verification skipped (SKIP_VERIFY=true)"
+    return 0
+  fi
+
+  if [ ! -f "$bundle" ]; then
+    log_warn "No cosign bundle present — skipping signature verification"
+    return 0
+  fi
+
+  log "Verifying tarball signature (cosign keyless bundle)..."
+  cosign_bin="$(ensure_cosign)"
+
+  expected_identity="${COSIGN_IDENTITY_PREFIX}${tag}"
+
+  if ! "$cosign_bin" verify-blob \
+    --bundle "$bundle" \
+    --certificate-identity "$expected_identity" \
+    --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+    "$tarball" >/dev/null 2>&1; then
+    die "Tarball signature verification failed for $tarball. Set SKIP_VERIFY=true to skip verification."
+  fi
+
+  log_ok "Tarball signature verified"
+}
+
+validate_tarball_entries() {
+  local tarball="$1"
+
+  # Reject absolute paths and any .. path segments (path traversal).
+  if tar -tzf "$tarball" | grep -E '^(\/|.*(^|\/)\.\.(\/|$))' >/dev/null 2>&1; then
+    die "Tarball contains unsafe paths (absolute or traversal)"
+  fi
+}
+
+# Download release artifacts
+download_release() {
+  local tag version_dir manifest_url tarball_url
+
+  # Determine tag (use latest if not specified)
+  tag="${1:-latest}"
+
+  if [ "$tag" = "latest" ]; then
+    log "Fetching latest release information..."
+
+    # Try to fetch latest release tag from GitHub API
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      tag="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/repos/krajh/oc-kickstart/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
+    else
+      tag="$(curl -fsSL https://api.github.com/repos/krajh/oc-kickstart/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
+    fi
+
+    # If API call failed, try using the Atom feed (more stable than HTML scraping)
+    if [ -z "$tag" ]; then
+      log_warn "GitHub API unavailable, trying releases feed..."
+      tag="$(curl -fsSL https://github.com/krajh/oc-kickstart/releases.atom 2>/dev/null | grep -o '<id>tag:github.com,2008:Repository/[^/]*/[^<]*</id>' | head -1 | sed 's|.*Repository/[^/]*/||; s|</id>||')"
+      # Validate tag format to avoid silently using unexpected values if the feed format changes
+      if [ -n "$tag" ] && ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_warn "Unexpected tag format from releases feed: '$tag'; ignoring."
+        tag=""
+      fi
+    fi
+
+    if [ -z "$tag" ]; then
+      die "Could not determine latest release tag. Please specify a version explicitly (e.g., ./oc-kickstart-install install v0.1.3)"
+    fi
+  fi
+
+  log "Using release tag: $tag"
+
+  version_dir="$VERSIONS_DIR/$tag"
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Dry run: would download release artifacts for $tag"
+    echo "$tag"
+    return 0
+  fi
+
+  mkdir -p "$version_dir"
+
+  manifest_url="https://github.com/krajh/oc-kickstart/releases/download/${tag}/manifest.json"
+  tarball_url="https://github.com/krajh/oc-kickstart/releases/download/${tag}/oc-kickstart-${tag}.tar.gz"
+  local bundle_url
+  bundle_url="https://github.com/krajh/oc-kickstart/releases/download/${tag}/oc-kickstart-${tag}.bundle.json"
+
+  log "Downloading manifest from $manifest_url..."
+  if ! curl -fsSL "$manifest_url" -o "$version_dir/manifest.json"; then
+    die "Failed to download manifest"
+  fi
+
+  log "Downloading tarball from $tarball_url..."
+  if ! curl -fsSL "$tarball_url" -o "$version_dir/oc-kickstart-${tag}.tar.gz"; then
+    die "Failed to download tarball"
+  fi
+
+  log "Downloading bundle from $bundle_url..."
+  if ! curl -fsSL "$bundle_url" -o "$version_dir/oc-kickstart-${tag}.bundle.json"; then
+    log_warn "Bundle not available for this release — cosign signature verification will be skipped"
+    rm -f "$version_dir/oc-kickstart-${tag}.bundle.json"
+  fi
+
+  # Verify tarball sha256 from manifest (best-effort parse; fail if present and mismatch)
+  local expected_sha actual_sha
+  expected_sha="$(grep -o '"sha256"\s*:\s*"[a-f0-9]\+"' "$version_dir/manifest.json" | head -1 | cut -d'"' -f4)"
+  actual_sha="$(file_sha256 "$version_dir/oc-kickstart-${tag}.tar.gz")"
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "$actual_sha" ]; then
+    die "Tarball sha256 mismatch"
+  fi
+
+  log_ok "Release artifacts downloaded to $version_dir"
+  echo "$tag"
+}
+
+# Extract tarball to version directory
+extract_tarball() {
+  local tag="$1" version_dir
+
+  version_dir="$VERSIONS_DIR/$tag"
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Dry run: would extract tarball to $version_dir"
+    return 0
+  fi
+
+  verify_tarball "$version_dir/oc-kickstart-${tag}.tar.gz" "$version_dir/oc-kickstart-${tag}.bundle.json" "$tag"
+  validate_tarball_entries "$version_dir/oc-kickstart-${tag}.tar.gz"
+
+  log "Extracting tarball..."
+  if ! tar -xzf "$version_dir/oc-kickstart-${tag}.tar.gz" -C "$version_dir"; then
+    die "Failed to extract tarball"
+  fi
+
+  # Keep versions/<tag>/ clean: remove downloaded artifacts after extraction.
+  rm -f \
+    "$version_dir/oc-kickstart-${tag}.tar.gz" \
+    "$version_dir/oc-kickstart-${tag}.bundle.json" \
+    "$version_dir/manifest.json" 2>/dev/null || true
+
+  log_ok "Tarball extracted"
+}
+
+activate_version() {
+  local tag="$1" version_dir
+  version_dir="$VERSIONS_DIR/$tag"
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Dry run: would activate $tag"
+    return 0
+  fi
+
+  ln -sfn "$version_dir" "$CURRENT_LINK"
+  log_ok "Symlink created: $CURRENT_LINK -> $version_dir"
+
+  # Clean up stale symlinks from pre-v0.3.0 directory renames.
+  # (agent -> agents, plugin -> plugins)
+  local -a STALE_LINKS=("agent" "plugin")
+  for old in "${STALE_LINKS[@]}"; do
+    if [ -L "$TARGET_DIR/$old" ]; then
+      rm -f "$TARGET_DIR/$old"
+      log "Removed stale symlink: $TARGET_DIR/$old"
+    fi
+  done
+
+  # Expose kit files at ~/.config/opencode/* via symlinks.
+  for item in "${KIT_LINK_ITEMS[@]}"; do
+    if [ -e "$TARGET_DIR/$item" ] && [ ! -L "$TARGET_DIR/$item" ]; then
+      log_warn "Not overwriting existing non-symlink: $TARGET_DIR/$item"
+      continue
+    fi
+
+    rm -rf "$TARGET_DIR/$item" 2>/dev/null || true
+    ln -sfn "$CURRENT_LINK/$item" "$TARGET_DIR/$item"
+  done
+}
+
+# Preserve .env and local/ directories
+preserve_local_state() {
+  local backup_env backup_local
+
+  if [ ! -d "$TARGET_DIR" ]; then
+    return 0
+  fi
+
+  backup_env="$(mktemp)"
+  backup_local="$(mktemp -d)"
+
+  if [ -f "$TARGET_DIR/.env" ]; then
+    log "Preserving .env file..."
+    cp "$TARGET_DIR/.env" "$backup_env"
+  fi
+
+  if [ -d "$TARGET_DIR/local" ]; then
+    log "Preserving local/ directory..."
+    cp -r "$TARGET_DIR/local" "$backup_local/"
+  fi
+
+  echo "$backup_env:$backup_local"
+}
+
+# Restore .env and local/ directories
+restore_local_state() {
+  local backup_info="$1" backup_env backup_local
+
+  backup_env="${backup_info%%:*}"
+  backup_local="${backup_info#*:}"
+
+  if [ -f "$backup_env" ] && [ -s "$backup_env" ]; then
+    log "Restoring .env file..."
+    cp "$backup_env" "$TARGET_DIR/.env"
+    rm -f "$backup_env"
+  fi
+
+  if [ -d "$backup_local/local" ]; then
+    log "Restoring local/ directory..."
+    cp -r "$backup_local/local" "$TARGET_DIR/"
+    rm -rf "$backup_local"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Personalisation-safe update helpers
+# ---------------------------------------------------------------------------
+
+# Cross-platform SHA256 helper (Linux: sha256sum, macOS: shasum -a 256)
+file_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    die "Neither sha256sum nor shasum found"
+  fi
+}
+
+# Compute SHA256 hashes of all files in a version directory and store them
+# in .oc-kickstart-manifest.json. Called immediately after extraction so the hashes
+# reflect the original kit state *before* any user personalisation.
+compute_manifest() {
+  local version_dir="$1"
+  local manifest_file="$version_dir/$MANIFEST_FILE"
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Dry run: would compute manifest for $version_dir"
+    return 0
+  fi
+
+  local version
+  version="$(basename "$version_dir")"
+  version="${version#v}"
+
+  local installed_at
+  installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  local temp_file
+  temp_file="$(mktemp)"
+
+  {
+    printf '{\n'
+    printf '  "version": "%s",\n' "$version"
+    printf '  "installedAt": "%s",\n' "$installed_at"
+    printf '  "installedVia": "tarball",\n'
+    printf '  "files": {'
+  } >"$temp_file"
+
+  local first=true
+  while IFS= read -r f; do
+    local rel
+    rel="${f#./}"
+    local hash
+    hash="$(file_sha256 "$version_dir/$rel")"
+    if [ "$first" = true ]; then
+      first=false
+    else
+      printf ',' >>"$temp_file"
+    fi
+    printf '\n    "%s": {"category":"managed","installedHash":"%s","sourceHash":"%s"}' \
+      "$rel" "$hash" "$hash" >>"$temp_file"
+  done < <(cd "$version_dir" && find . -type f ! -name "$MANIFEST_FILE" | sort)
+
+  {
+    printf '\n  }\n}\n'
+  } >>"$temp_file"
+
+  mv "$temp_file" "$manifest_file"
+  local file_count
+  file_count="$(jq -r '.files | length' "$manifest_file" 2>/dev/null || echo "?")"
+  log_ok "Manifest written ($file_count files)"
+}
+
+# Compare current version files against stored manifest.
+# Outputs lines:  M <relpath>  (modified)   A <relpath>  (added by user)
+# Returns 0 if personalised files were found, 1 otherwise.
+detect_user_modifications() {
+  local version_dir="$1"
+  local manifest_file="$version_dir/$MANIFEST_FILE"
+
+  if [ ! -f "$manifest_file" ]; then
+    log_warn "No manifest found in current version."
+    log_warn "Cannot detect personalisations (version predates this feature)."
+    return 1
+  fi
+
+  local found=false
+
+  # Check each tracked file for modification.
+  # Read all installedHash values in one jq pass to avoid N subprocess forks.
+  local manifest_pairs
+  manifest_pairs="$(jq -r '.files | to_entries[] | "\(.key)\t\(.value.installedHash)"' "$manifest_file" 2>/dev/null || true)"
+  if [ -n "$manifest_pairs" ]; then
+    local manifest_pairs_file
+    manifest_pairs_file="$(mktemp)"
+    printf '%s\n' "$manifest_pairs" >"$manifest_pairs_file"
+    while IFS=$'\t' read -r rel expected_hash; do
+      [ -z "$rel" ] && continue
+      local file_abs="$version_dir/$rel"
+      if [ ! -f "$file_abs" ]; then
+        continue
+      fi
+      local actual_hash
+      actual_hash="$(file_sha256 "$file_abs")"
+      if [ "$expected_hash" != "$actual_hash" ]; then
+        printf "M %s\n" "$rel"
+        found=true
+      fi
+    done <"$manifest_pairs_file"
+    rm -f "$manifest_pairs_file"
+  fi
+
+  # Detect user-added files (not in the original manifest).
+  # Build key set in one jq pass to avoid N subprocess forks.
+  # Use a temp file instead of declare -A for bash 3.2 compatibility (macOS default).
+  local manifest_keys_file
+  manifest_keys_file="$(mktemp)"
+  jq -r '.files | keys[]' "$manifest_file" 2>/dev/null >"$manifest_keys_file" || true
+
+  local version_files_list
+  version_files_list="$(mktemp)"
+  (cd "$version_dir" && find . -type f ! -name "$MANIFEST_FILE" | sort) >"$version_files_list"
+
+  while IFS= read -r f; do
+    local rel
+    rel="${f#./}"
+    if ! grep -qxF "$rel" "$manifest_keys_file" 2>/dev/null; then
+      printf "A %s\n" "$rel"
+      found=true
+    fi
+  done <"$version_files_list"
+
+  rm -f "$manifest_keys_file"
+  rm -f "$version_files_list"
+
+  if [ "$found" = true ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Copy user-modified/added files into a temporary stash directory.
+stash_modifications() {
+  local version_dir="$1"
+  local stash_dir="$2"
+
+  mkdir -p "$stash_dir"
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    local type file_rel
+    type="${line%% *}"
+    file_rel="${line#* }"
+    local src="$version_dir/$file_rel"
+    local dst="$stash_dir/$file_rel"
+
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+
+    case "$type" in
+    M) log "  Stashed modified: $file_rel" ;;
+    A) log "  Stashed added:    $file_rel" ;;
+    esac
+  done
+}
+
+# Prompt the user to resolve a single conflict (interactive).
+# Falls back to keeping the new version with a .user sidecar in non-interactive mode.
+handle_conflict() {
+  local rel_path="$1"
+  local user_file="$2"
+  local new_file="$3"
+
+  if [ "$NO_PROMPT" = true ] || [ ! -t /dev/tty ]; then
+    cp "$user_file" "${new_file}.user"
+    log_warn "  Conflict: $rel_path (kept new version; your version saved as ${rel_path}.user)"
+    return
+  fi
+
+  log_warn "  Conflict: $rel_path"
+  log "  Both your version and the new release modified this file."
+  printf "  [k]eep yours / [o]verwrite with new / [d]iff / [s]kip? " >&2
+
+  while true; do
+    local choice raw
+    IFS= read -r raw </dev/tty || {
+      # EOF — default to non-destructive: save user copy alongside new file
+      printf "\n" >&2
+      cp "$user_file" "${new_file}.user"
+      log_warn "  Conflict: $rel_path (EOF; kept new version; your version saved as ${rel_path}.user)"
+      return
+    }
+    choice="${raw:0:1}"
+
+    case "$choice" in
+    k | K)
+      cp "$user_file" "$new_file"
+      log_ok "  Kept your version: $rel_path"
+      break
+      ;;
+    o | O)
+      log_ok "  Using new version: $rel_path"
+      break
+      ;;
+    d | D)
+      if command -v diff >/dev/null 2>&1; then
+        printf "\n" >&2
+        diff --color=auto -u "$new_file" "$user_file" >&2 || true
+        printf "\n" >&2
+      else
+        log_warn "  diff not available"
+      fi
+      printf "  [k]eep yours / [o]verwrite with new / [d]iff / [s]kip? " >&2
+      ;;
+    s | S)
+      cp "$user_file" "${new_file}.user"
+      log "  Skipped: $rel_path (your version saved as ${rel_path}.user)"
+      break
+      ;;
+    "")
+      # bare Enter — re-print prompt without noise
+      printf "  [k]eep yours / [o]verwrite with new / [d]iff / [s]kip? " >&2
+      ;;
+    *)
+      printf "  Unknown choice '%s'. [k]eep / [o]verwrite / [d]iff / [s]kip? " "$choice" >&2
+      ;;
+    esac
+  done
+}
+
+# JSON-aware merge for opencode.json.
+# Takes the new release's file as base and overlays:
+#   - agent.*.model values from the user's stashed version
+#   - any top-level keys present in stash but absent in the new file (user additions)
+# Falls back to handle_conflict if jq is unavailable.
+# Returns 0 on success, 1 if fallback to conflict handling is needed.
+merge_opencode_json() {
+  local stashed_file="$1"
+  local new_file="$2"
+
+  if ! command -v jq >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+
+  # Build a jq script that:
+  # 1. Extracts each agent's model from the stash and applies it to the new file
+  #    (only if the agent exists in both and the stash has a non-empty model)
+  # 2. Deep-merges any top-level keys present in stash but absent in new file
+  jq -s '
+    .[0] as $new |
+    .[1] as $user |
+
+    # Collect agent model overrides: for each agent in $user.agent, if it has a
+    # non-empty .model and that agent exists in $new.agent, carry the model over.
+    ($user.agent // {} | to_entries | map(
+      select(.value.model != null and .value.model != "")
+      | {key: .key, value: .value.model}
+    ) | from_entries) as $agent_models |
+
+    # Collect user-added top-level keys (present in $user, absent in $new).
+    ($user | to_entries | map(select($new[.key] == null)) | from_entries) as $user_additions |
+
+    # Start from new release base, apply user additions, then patch agent models.
+    ($new * $user_additions) |
+    .agent = (
+      .agent | to_entries | map(
+        if $agent_models[.key] != null
+        then .value.model = $agent_models[.key]
+        else .
+        end
+      ) | from_entries
+    )
+  ' "$new_file" "$stashed_file" >"$tmp" 2>/dev/null
+
+  if [ $? -ne 0 ] || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  mv "$tmp" "$new_file"
+  return 0
+}
+
+# Reapply stashed personalisations onto the new version directory.
+# Uses a 3-way strategy:
+#   old original == new file  →  only user changed → apply user's version
+#   old original != new file  →  both changed      → JSON-aware merge (opencode.json)
+#                                                     or conflict prompt (other files)
+#   file not in new version   →  user-added         → copy over
+reapply_modifications() {
+  local new_version_dir="$1"
+  local stash_dir="$2"
+  local old_manifest_file="$3"
+
+  local applied=0 conflicts=0 added=0
+
+  # Load all installedHash values from the old manifest in one jq pass.
+  # Use a temp file instead of declare -A for bash 3.2 compatibility (macOS default).
+  local old_hashes_file
+  old_hashes_file="$(mktemp)"
+  jq -r '.files | to_entries[] | "\(.key)\t\(.value.installedHash)"' "$old_manifest_file" 2>/dev/null >"$old_hashes_file" || true
+
+  # Helper to look up a hash by relative path from the temp file.
+  _lookup_old_hash() { awk -F'\t' -v key="$1" '$1 == key { print $2; found=1; exit } END { if (!found) print "" }' "$old_hashes_file"; }
+
+  # Collect stashed files into array first so stdin stays free for handle_conflict.
+  local stashed_files=()
+  local stashed_files_list
+  stashed_files_list="$(mktemp)"
+  find "$stash_dir" -type f >"$stashed_files_list"
+  while IFS= read -r f; do
+    stashed_files+=("$f")
+  done <"$stashed_files_list"
+  rm -f "$stashed_files_list"
+
+  for stashed_file in "${stashed_files[@]}"; do
+    local rel_path="${stashed_file#"$stash_dir"/}"
+    local new_file="$new_version_dir/$rel_path"
+
+    if [ ! -f "$new_file" ]; then
+      # File doesn't exist in new version — user-added, just copy it over
+      mkdir -p "$(dirname "$new_file")"
+      cp "$stashed_file" "$new_file"
+      log_ok "  Restored user-added: $rel_path"
+      added=$((added + 1))
+      continue
+    fi
+
+    # File exists in both. Was it also changed in the new release?
+    local old_hash new_hash
+    old_hash="$(_lookup_old_hash "$rel_path")"
+    new_hash="$(file_sha256 "$new_file")"
+
+    if [ -z "$old_hash" ] || [ "$old_hash" = "null" ]; then
+      # File didn't exist in old version but exists in both user stash and new
+      handle_conflict "$rel_path" "$stashed_file" "$new_file"
+      conflicts=$((conflicts + 1))
+      continue
+    fi
+
+    if [ "$old_hash" = "$new_hash" ]; then
+      # New release didn't change this file — safe to apply user's version
+      cp "$stashed_file" "$new_file"
+      log_ok "  Applied personalisation: $rel_path"
+      applied=$((applied + 1))
+    elif [ "$rel_path" = "opencode.json" ]; then
+      # opencode.json changed in both — use JSON-aware merge to preserve
+      # agent model choices and user additions without losing new models/config.
+      if merge_opencode_json "$stashed_file" "$new_file"; then
+        log_ok "  Merged opencode.json (agent models and user additions preserved)"
+        applied=$((applied + 1))
+      else
+        log_warn "  opencode.json merge failed (jq error) — falling back to conflict prompt"
+        handle_conflict "$rel_path" "$stashed_file" "$new_file"
+        conflicts=$((conflicts + 1))
+      fi
+    else
+      # Both user and new release modified this file — conflict
+      handle_conflict "$rel_path" "$stashed_file" "$new_file"
+      conflicts=$((conflicts + 1))
+    fi
+  done
+
+  rm -f "$old_hashes_file"
+  unset -f _lookup_old_hash
+
+  log "Personalisation summary: $applied applied, $added user-added restored, $conflicts conflicts"
+}
+
+# Install fresh configuration
+cmd_install() {
+  local tag version_dir
+
+  show_logo
+  echo ""
+  log "Starting fresh installation..."
+  detect_platform
+  check_prerequisites
+
+  # Check and install OpenCode if needed
+  ensure_opencode
+
+  if [ -d "$TARGET_DIR" ]; then
+    die "Installation directory already exists at $TARGET_DIR. Use 'update' to refresh or remove the directory manually."
+  fi
+
+  # Download release
+  tag="$(download_release "${1:-latest}")"
+  version_dir="$VERSIONS_DIR/$tag"
+
+  # Extract
+  extract_tarball "$tag"
+
+  # Select provider, then optionally customise per-agent models BEFORE computing
+  # manifest (manifest captures patched state as baseline for future update detection)
+  select_provider
+  select_agent_models
+  configure_agent_models "$version_dir"
+
+  # Store baseline manifest so future updates can detect personalizations
+  compute_manifest "$version_dir"
+
+  mkdir -p "$TARGET_DIR"
+  activate_version "$tag"
+
+  # API keys based on provider selection
+  case "$PROVIDER_CHOICE" in
+  nvidia)
+    ensure_nvidia_key
+    ;;
+  openrouter)
+    ensure_openrouter_key
+    ;;
+  opencode)
+    log "OpenCode provider selected — no API key required."
+    ;;
+  esac
+
+  ensure_frieren
+  ensure_shade
+  configure_opencode_mem
+
+  log_ok "Installation complete at $TARGET_DIR"
+  log "Run 'opencode' to begin using the configuration."
+}
+
+# Update existing installation
+cmd_update() {
+  local tag backup_info version_dir
+  local current_version_dir="" stash_dir="" old_manifest_backup="" modifications=""
+
+  show_logo
+  echo ""
+  log "Starting update..."
+  detect_platform
+  check_prerequisites
+
+  # Check and install OpenCode if needed
+  ensure_opencode
+
+  if [ ! -d "$TARGET_DIR" ]; then
+    die "No existing installation found at $TARGET_DIR. Use 'install' for fresh installation."
+  fi
+
+  # Backup existing config
+  if [ "$DRY_RUN" = false ]; then
+    mkdir -p "$BACKUP_ROOT"
+    log "Archiving existing configuration to $BACKUP_PATH"
+    cp -r "$TARGET_DIR" "$BACKUP_PATH"
+  else
+    log "Dry run: would archive to $BACKUP_PATH"
+  fi
+
+  # ── Personalisation detection ──────────────────────────────────────
+  if [ -L "$CURRENT_LINK" ]; then
+    # readlink -f is GNU-only; fall back to perl (available on macOS) then no-op.
+    current_version_dir="$(readlink -f "$CURRENT_LINK" 2>/dev/null \
+      || perl -MCwd -e 'print Cwd::abs_path(shift)' "$CURRENT_LINK" 2>/dev/null \
+      || echo "")"
+  fi
+
+  if [ -n "$current_version_dir" ] && [ -f "$current_version_dir/$MANIFEST_FILE" ]; then
+    modifications="$(detect_user_modifications "$current_version_dir")"
+    if [ -n "$modifications" ]; then
+      local mod_count
+      mod_count="$(echo "$modifications" | wc -l | tr -d ' ')"
+      log "Detected $mod_count personalised file(s):"
+      echo "$modifications" | while IFS= read -r line; do
+        log "  $line"
+      done
+
+      stash_dir="$(mktemp -d)"
+      echo "$modifications" | stash_modifications "$current_version_dir" "$stash_dir"
+
+      # Keep a copy of the old manifest for 3-way conflict detection
+      old_manifest_backup="$(mktemp)"
+      cp "$current_version_dir/$MANIFEST_FILE" "$old_manifest_backup"
+    else
+      log "No personalised files detected — clean update."
+    fi
+  elif [ -n "$current_version_dir" ]; then
+    log_warn "No manifest in current version. Personalisation detection unavailable."
+    log_warn "Your changes (if any) inside the version directory will not be preserved."
+    log_warn "Future updates will support this after this upgrade completes."
+  fi
+
+  # Preserve local state (.env, local/)
+  backup_info="$(preserve_local_state)"
+
+  # Download release
+  tag="$(download_release "${1:-latest}")"
+  version_dir="$VERSIONS_DIR/$tag"
+
+  # Extract
+  extract_tarball "$tag"
+
+  # Select/confirm provider, then optionally customise per-agent models BEFORE
+  # computing manifest
+  select_provider
+  select_agent_models
+  configure_agent_models "$version_dir"
+
+  # Store baseline manifest for the new version BEFORE applying personalisations
+  compute_manifest "$version_dir"
+
+  # ── Reapply personalisations ───────────────────────────────────────
+  if [ -n "$stash_dir" ] && [ -d "$stash_dir" ]; then
+    log "Reapplying personalised files to $tag..."
+    reapply_modifications "$version_dir" "$stash_dir" "$old_manifest_backup"
+    rm -rf "$stash_dir"
+    rm -f "$old_manifest_backup"
+  fi
+
+  # Activate
+  activate_version "$tag"
+
+  # Restore local state
+  if [ "$DRY_RUN" = false ]; then
+    restore_local_state "$backup_info"
+    # Re-persist MODEL_PROVIDER — restore_local_state replaces .env with the
+    # pre-update backup, which won't contain MODEL_PROVIDER on first upgrade
+    write_env_key "MODEL_PROVIDER" "$PROVIDER_CHOICE"
+  fi
+
+  # API keys based on provider selection
+  case "$PROVIDER_CHOICE" in
+  nvidia)
+    ensure_nvidia_key
+    ;;
+  openrouter)
+    ensure_openrouter_key
+    ;;
+  opencode)
+    log "OpenCode provider selected — no API key required."
+    ;;
+  esac
+
+  ensure_frieren
+  ensure_shade
+  configure_opencode_mem
+
+  log_ok "Update complete"
+  log "Run 'opencode' to use the updated configuration."
+}
+
+# Show installation status
+cmd_status() {
+  if [ ! -d "$TARGET_DIR" ]; then
+    log "No installation found at $TARGET_DIR"
+    return 1
+  fi
+
+  log "Installation status:"
+  log "  Location: $TARGET_DIR"
+
+  if [ -L "$CURRENT_LINK" ]; then
+    local current_version
+    current_version="$(readlink "$CURRENT_LINK" | xargs basename)"
+    log "  Current version: $current_version"
+  fi
+
+  if [ -d "$VERSIONS_DIR" ]; then
+    log "  Available versions:"
+    for version_dir in "$VERSIONS_DIR"/*; do
+      if [ -d "$version_dir" ]; then
+        local version
+        version="$(basename "$version_dir")"
+        log "    - $version"
+      fi
+    done
+  fi
+
+  if [ -f "$TARGET_DIR/.env" ]; then
+    log_ok ".env file is present"
+  fi
+
+  if [ -d "$TARGET_DIR/local" ]; then
+    log_ok "local/ directory is present"
+  fi
+
+  if [ -d "$TARGET_DIR/$INCOMING_DIR" ]; then
+    local incoming_count
+    incoming_count="$(
+      find "$TARGET_DIR/$INCOMING_DIR" -type f 2>/dev/null | wc -l | tr -d ' '
+    )"
+    if [ "$incoming_count" -eq 0 ]; then
+      log "No pending conflicts."
+    else
+      log_warn "Pending conflicts:"
+      find "$TARGET_DIR/$INCOMING_DIR" -type f 2>/dev/null | while IFS= read -r file; do
+        log "  ${file#"$TARGET_DIR/"}"
+      done
+    fi
+  else
+    log "No pending conflicts."
+  fi
+}
+
+# Rollback to previous version
+cmd_rollback() {
+  local latest_backup
+
+  if [ ! -d "$BACKUP_ROOT" ]; then
+    die "No backups found at $BACKUP_ROOT"
+  fi
+
+  latest_backup="$(ls -td "$BACKUP_ROOT"/oc-kickstart-* 2>/dev/null | head -1)"
+
+  if [ -z "$latest_backup" ]; then
+    die "No backups found"
+  fi
+
+  log "Rolling back to: $latest_backup"
+
+  if [ "$DRY_RUN" = false ]; then
+    rm -rf "$TARGET_DIR"
+    cp -r "$latest_backup" "$TARGET_DIR"
+    log_ok "Rollback complete"
+  else
+    log "Dry run: would restore from $latest_backup"
+  fi
+}
+
+cmd_resolve() {
+  local mode="${1:-}"
+
+  if [ ! -d "$TARGET_DIR" ]; then
+    log "No installation found at $TARGET_DIR"
+    return 1
+  fi
+
+  if [ "$mode" != "--accept-incoming" ] && [ "$mode" != "--keep-mine" ]; then
+    log_error "Usage: oc-kickstart-install resolve --accept-incoming|--keep-mine"
+    return 1
+  fi
+
+  local incoming_path="$TARGET_DIR/$INCOMING_DIR"
+  if [ ! -d "$incoming_path" ]; then
+    log "No pending conflicts."
+    return 0
+  fi
+
+  local pending_files
+  pending_files="$(find "$incoming_path" -type f 2>/dev/null || true)"
+  if [ -z "$pending_files" ]; then
+    log "No pending conflicts."
+    return 0
+  fi
+
+  local current_version_dir=""
+  if [ -L "$CURRENT_LINK" ]; then
+    current_version_dir="$(readlink -f "$CURRENT_LINK")"
+  fi
+
+  local manifest_file=""
+  if [ -n "$current_version_dir" ] && [ -f "$current_version_dir/$MANIFEST_FILE" ]; then
+    manifest_file="$current_version_dir/$MANIFEST_FILE"
+  fi
+
+  local pending_files_list
+  pending_files_list="$(mktemp)"
+  printf '%s\n' "$pending_files" >"$pending_files_list"
+
+  while IFS= read -r incoming_file; do
+    [ -z "$incoming_file" ] && continue
+    local rel_path
+    rel_path="${incoming_file#"$incoming_path/"}"
+    local dest_path="$TARGET_DIR/$rel_path"
+
+    if [ "$mode" = "--accept-incoming" ]; then
+      mkdir -p "$(dirname "$dest_path")"
+      cp "$incoming_file" "$dest_path"
+
+      if [ -n "$manifest_file" ]; then
+        local hash
+        hash="$(file_sha256 "$dest_path")"
+        jq --arg p "$rel_path" --arg h "$hash" \
+          '.files[$p].installedHash = $h | .files[$p].sourceHash = $h' \
+          "$manifest_file" >"$manifest_file.tmp" && mv "$manifest_file.tmp" "$manifest_file"
+      fi
+
+      log_ok "Accepted incoming: $rel_path"
+    else
+      log_ok "Kept mine: $rel_path"
+    fi
+
+    rm -f "$incoming_file"
+  done <"$pending_files_list"
+  rm -f "$pending_files_list"
+
+  find "$incoming_path" -type d -empty -delete 2>/dev/null || true
+}
+
+# Dry run mode
+cmd_dry_run() {
+  DRY_RUN=true
+  log "Running in DRY RUN mode - no changes will be made"
+
+  detect_platform
+  check_prerequisites
+
+  if [ -d "$TARGET_DIR" ]; then
+    log "Existing installation found at $TARGET_DIR"
+    cmd_update "${1:-latest}"
+  else
+    log "No existing installation found"
+    cmd_install "${1:-latest}"
+  fi
+
+  log_ok "Dry run complete"
+}
+
+# Show help
+show_help() {
+  cat <<EOF
+oc-kickstart Installer (OpenCode configuration)
+
+USAGE:
+  oc-kickstart-install <command> [options]
+
+COMMANDS:
+  install [TAG]     Fresh installation (default: latest release)
+  update [TAG]      Update existing installation (default: latest release)
+  status            Show installation status
+  rollback          Restore previous backup
+  resolve           Resolve staged conflicts (accept incoming or keep mine)
+  dry-run [TAG]     Simulate installation without making changes
+
+OPTIONS:
+  -v, --verbose              Enable verbose output
+  -h, --help                 Show this help message
+  --no-prompt                Do not prompt for interactive input (fail if required)
+  --provider PROVIDER        Model provider: nvidia, openrouter, or opencode (skips prompt)
+  --frieren                  Install/update Frieren local AI memory server (skips prompt)
+  --no-frieren               Skip Frieren installation entirely
+  --frieren-path PATH        Override Frieren install directory (default: ~/dev/frieren)
+  --shade                    Install/update Shade background executor (skips prompt)
+  --no-shade                 Skip Shade installation entirely
+  --models                   Customise per-agent model assignments (skips "Customise?" prompt)
+
+EXAMPLES:
+  oc-kickstart-install install
+  oc-kickstart-install install --provider nvidia
+  oc-kickstart-install install --provider openrouter
+  oc-kickstart-install install --provider nvidia --models
+  oc-kickstart-install update
+  oc-kickstart-install update --models
+  oc-kickstart-install status
+  oc-kickstart-install rollback
+  oc-kickstart-install resolve --accept-incoming
+  oc-kickstart-install resolve --keep-mine
+  oc-kickstart-install dry-run
+
+ENVIRONMENT:
+  WSL/Linux/macOS (x86_64/amd64/arm64 architecture required)
+  Requires: curl, tar, mkdir (jq recommended for automatic model configuration)
+
+  MODEL_PROVIDER  Which model backend to use: 'nvidia', 'openrouter', or 'opencode'
+                  Prompted interactively on first install; saved to .env thereafter.
+                  Override via --provider flag or MODEL_PROVIDER env var.
+
+  NVIDIA_API_KEY    API key for NVIDIA NIM API (nvidia provider only).
+                  Optional if set in ~/.config/opencode/.env.
+                  Not required for openrouter or opencode providers.
+
+  OPENROUTER_API_KEY  API key for OpenRouter API (openrouter provider only).
+                  Optional if set in ~/.config/opencode/.env.
+                  Not required for nvidia or opencode providers.
+
+  INSTALL_FRIEREN Set to 'true' to always install/update Frieren; 'false' to skip.
+                  If unset, the installer prompts interactively (unless --no-prompt).
+
+  FRIEREN_DIR     Directory where Frieren is cloned/stored. Default: ~/dev/frieren.
+
+  INSTALL_SHADE   Set to 'true' to always install/update Shade; 'false' to skip.
+                  If unset, the installer prompts interactively (unless --no-prompt).
+
+  SHADE_DIR       Directory where Shade harness is installed.
+                  Default: ~/.config/opencode/shade-pico.
+
+  CUSTOMIZE_MODELS  Set to 'true' to always prompt for per-agent model customisation;
+                    'false' to always use defaults. If unset, prompts interactively.
+
+  AGENT_MODEL_<NAME>  Override the model for a specific agent (NAME = ARCHITECT,
+                      STRATEGIST, IMPLEMENTER, REVIEWER, RESEARCH). Saved to .env
+                      after interactive customisation and reused on future updates.
+
+DEFAULT AGENT MODELS:
+  Agent         nvidia (default)                  openrouter                           opencode
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  architect     nvidia/llama-3.3-70b-instruct     openrouter/gemini-2.5-flash-exp:free  opencode/default
+  strategist    nvidia/llama-3.3-70b-instruct     openrouter/gemini-2.5-flash-exp:free  opencode/default
+  implementer   nvidia/qwen2.5-coder-32b          openrouter/gemini-2.5-flash-exp:free  opencode/codex
+  reviewer      nvidia/mistral-large              openrouter/llama-3.2-3b-instruct:free opencode/default
+  research      nvidia/llama-3.3-70b-instruct     openrouter/gemini-2.5-flash-exp:free  opencode/default
+
+  Use --models to customise any agent's model during install/update.
+  Choices are saved to .env (AGENT_MODEL_<NAME>) and reused on future updates.
+
+NOTES:
+  When using 'curl | bash' with the nvidia provider, export variables before the pipe:
+    export NVIDIA_API_KEY="your-key"
+    curl -fsSL ... | bash
+
+  When using the openrouter provider, export your key before the pipe:
+    export OPENROUTER_API_KEY="your-key"
+    curl -fsSL ... | bash -s -- install --provider openrouter
+
+  When using the opencode provider, no API key is required:
+    curl -fsSL ... | bash -s -- install --provider opencode
+
+PERSONALISATION SAFETY:
+  The 'update' command automatically detects files you've modified or added
+  inside the active version directory. Your changes are stashed, the new
+  version is applied, and your personalisations are reapplied via 3-way merge.
+
+  Interactive mode:  conflicts prompt [k]eep/[o]verwrite/[d]iff/[s]kip
+  Non-interactive:   new version wins; your file saved as <name>.user
+
+  Files outside the version directory (.env, local/) are always preserved.
+
+EOF
+}
+
+# Main entry point
+main() {
+  case "${COMMAND}" in
+  install)
+    cmd_install "${TAG:-latest}"
+    ;;
+  update)
+    cmd_update "${TAG:-latest}"
+    ;;
+  status)
+    cmd_status
+    ;;
+  rollback)
+    cmd_rollback
+    ;;
+  resolve)
+    cmd_resolve "${POSITIONAL[1]:-}"
+    ;;
+  dry-run)
+    cmd_dry_run "${TAG:-latest}"
+    ;;
+  -h | --help | help)
+    show_help
+    ;;
+  *)
+    log_error "Unknown command: $COMMAND"
+    show_help
+    exit 1
+    ;;
+  esac
+}
+
+main "$@"

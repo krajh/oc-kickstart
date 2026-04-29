@@ -1,0 +1,13 @@
+{
+  "ses_2695ba6adffepTLSLE3pDfycjF": {
+    "routing_rules": 19,
+    "skill_budget_cap": 19,
+    "lesson_nudge": 2,
+    "coder_task_tracked": 1,
+    "review_reminder": 1
+  },
+  "ses_269548633ffe1ZGzVOpb86Kim3": {
+    "routing_rules": 2,
+    "skill_budget_cap": 2
+  }
+}
