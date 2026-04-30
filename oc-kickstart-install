@@ -834,9 +834,9 @@ ensure_frieren() {
 # ---------------------------------------------------------------------------
 
 install_shade_files() {
-  local kit_shade_dir="$SCRIPT_DIR/shade"
-  if [ ! -d "$kit_shade_dir" ]; then
-    log_warn "Shade files not found in kit at $kit_shade_dir — skipping"
+  local kit_shade_dir=""
+  if ! kit_shade_dir="$(resolve_optional_asset_dir "shade")"; then
+    log_warn "Shade files not found in activated release or next to installer — skipping"
     return 1
   fi
 
@@ -852,6 +852,26 @@ install_shade_files() {
   else
     log "[dry-run] cp shade/* → $SHADE_DIR"
   fi
+}
+
+resolve_optional_asset_dir() {
+  local asset_name="$1"
+  local current_asset_dir="$CURRENT_LINK/$asset_name"
+  local script_asset_dir="$SCRIPT_DIR/$asset_name"
+
+  # Installed releases should source optional assets from the activated version.
+  # Local/dev installer runs fall back to sibling paths next to the script.
+  if [ -d "$current_asset_dir" ]; then
+    printf '%s\n' "$current_asset_dir"
+    return 0
+  fi
+
+  if [ -d "$script_asset_dir" ]; then
+    printf '%s\n' "$script_asset_dir"
+    return 0
+  fi
+
+  return 1
 }
 
 install_shade_aliases() {

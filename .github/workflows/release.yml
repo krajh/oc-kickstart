@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release assets
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash ./scripts/build-release-assets.sh "$TAG"
+
+      - name: Install cosign
+        id: install_cosign
+        continue-on-error: true
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Sign release tarball
+        id: sign_release_tarball
+        if: ${{ steps.install_cosign.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cosign sign-blob \
+            --yes \
+            --bundle "dist/release/oc-kickstart-${TAG}.bundle.json" \
+            "dist/release/oc-kickstart-${TAG}.tar.gz"
+
+      - name: Add bundle metadata to manifest
+        if: ${{ hashFiles(format('dist/release/oc-kickstart-{0}.bundle.json', github.ref_name)) != '' }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 -c "import json, os, pathlib; manifest_path = pathlib.Path('dist/release/manifest.json'); data = json.loads(manifest_path.read_text()); data['bundle'] = f'oc-kickstart-{os.environ[\"TAG\"]}.bundle.json'; manifest_path.write_text(json.dumps(data, indent=2) + '\n')"
+
+      - name: Warn when cosign signing is unavailable
+        if: ${{ steps.install_cosign.outcome != 'success' || steps.sign_release_tarball.outcome != 'success' || hashFiles(format('dist/release/oc-kickstart-{0}.bundle.json', github.ref_name)) == '' }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "${{ steps.install_cosign.outcome }}" != 'success' ]]; then
+            echo "[warn] cosign install failed; continuing without bundle upload"
+          elif [[ "${{ steps.sign_release_tarball.outcome }}" != 'success' ]]; then
+            echo "[warn] cosign signing failed; continuing without bundle upload"
+          elif [[ ! -f "dist/release/oc-kickstart-${TAG}.bundle.json" ]]; then
+            echo "[warn] cosign bundle not produced; continuing without bundle upload"
+          fi
+
+      - name: Collect release files
+        id: collect_release_files
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo 'files<<EOF'
+            echo 'dist/release/install'
+            echo 'dist/release/manifest.json'
+            echo 'dist/release/oc-kickstart-install'
+            echo "dist/release/oc-kickstart-${TAG}.tar.gz"
+            if [[ -f "dist/release/oc-kickstart-${TAG}.bundle.json" ]]; then
+              echo "dist/release/oc-kickstart-${TAG}.bundle.json"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: ${{ steps.collect_release_files.outputs.files }}
